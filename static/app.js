@@ -141,6 +141,12 @@ function setupEventListeners() {
     }
   });
 
+  const targetSizePreset = document.getElementById('targetSizePreset');
+  targetSizePreset.addEventListener('change', () => {
+    const isCustom = targetSizePreset.value === 'custom';
+    document.getElementById('customSizeWrap').classList.toggle('hidden', !isCustom);
+  });
+
   // Event delegation for task lists (safe against quotes/special chars in paths & no inline onclick)
   const handleTaskListClick = (e) => {
     const btn = e.target.closest('button[data-action]');
@@ -165,15 +171,61 @@ function updateBatchCount() {
   document.getElementById('batchCountLabel').textContent = `${lines.length} 件の有効なURL`;
 }
 
+function getTargetSizeMb() {
+  const preset = document.getElementById('targetSizePreset').value;
+  if (preset === 'none') return null;
+  if (preset === 'custom') {
+    const val = parseFloat(document.getElementById('customTargetSizeMb').value);
+    return Number.isFinite(val) && val >= 1 ? val : null;
+  }
+  const num = parseFloat(preset);
+  return Number.isFinite(num) && num >= 1 ? num : null;
+}
+
 function switchInputMode(mode) {
   inputMode = mode;
   document.getElementById('singleModeBtn').classList.toggle('active', mode === 'single');
   document.getElementById('batchModeBtn').classList.toggle('active', mode === 'batch');
+  document.getElementById('localModeBtn').classList.toggle('active', mode === 'local');
   document.getElementById('singleInputBox').classList.toggle('hidden', mode !== 'single');
   document.getElementById('batchInputBox').classList.toggle('hidden', mode !== 'batch');
+  document.getElementById('localInputBox').classList.toggle('hidden', mode !== 'local');
+  document.getElementById('downloadFormatSection').classList.toggle('hidden', mode === 'local');
 
+  const step1Title = document.getElementById('step1Title');
   const btnText = document.getElementById('downloadBtnText');
-  btnText.textContent = mode === 'batch' ? '一括ダウンロード開始' : 'ダウンロード開始';
+  const presetSelect = document.getElementById('targetSizePreset');
+
+  if (mode === 'local') {
+    step1Title.textContent = '1. 圧縮する動画・音声ファイルを選択';
+    btnText.textContent = '目標サイズ以下へ圧縮開始';
+    if (presetSelect.value === 'none') {
+      presetSelect.value = '20';
+      document.getElementById('customSizeWrap').classList.add('hidden');
+    }
+  } else {
+    step1Title.textContent = '1. 動画・音声のURLを入力';
+    btnText.textContent = mode === 'batch' ? '一括ダウンロード開始' : 'ダウンロード開始';
+  }
+}
+
+async function pickLocalFile() {
+  const saveDir = document.getElementById('saveDirInput').value.trim();
+  try {
+    const res = await fetch('/api/pick-file', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ current_dir: saveDir })
+    });
+    const data = await res.json();
+    if (res.ok && data.selected && data.path) {
+      document.getElementById('localFileInput').value = data.path;
+      document.getElementById('localFileSizeBadge').textContent = `元サイズ: ${data.size_str || '-'}`;
+      document.getElementById('localFileMeta').classList.remove('hidden');
+    }
+  } catch (e) {
+    showToast('ファイル選択ダイアログを開けませんでした');
+  }
 }
 
 function setMediaType(type) {
@@ -451,6 +503,47 @@ async function startDownload() {
   const customFilename = document.getElementById('customFilenameInput').value.trim();
   const embedThumb = document.getElementById('embedThumbCheck').checked;
   const embedSubs = document.getElementById('embedSubsCheck').checked;
+  const targetSizeMb = getTargetSizeMb();
+
+  if (inputMode === 'local') {
+    const inputPath = document.getElementById('localFileInput').value.trim();
+    if (!inputPath) {
+      showToast('圧縮するファイルを選択してください');
+      return;
+    }
+    if (!targetSizeMb) {
+      showToast('目標ファイルサイズ（例: 20 MB 以下）を選択してください');
+      return;
+    }
+    try {
+      const btn = document.getElementById('downloadBtn');
+      btn.disabled = true;
+      const res = await fetch('/api/compress-local', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          input_path: inputPath,
+          save_dir: saveDir,
+          target_size_mb: targetSizeMb,
+          start_time: startTime,
+          end_time: endTime,
+          custom_filename: customFilename,
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || '圧縮の開始に失敗しました');
+      }
+      switchRightTab('queue');
+      showToast(`${targetSizeMb}MB 以下への圧縮をキューに追加しました`);
+      await pollTasks();
+    } catch (e) {
+      showToast(e.message);
+    } finally {
+      document.getElementById('downloadBtn').disabled = false;
+    }
+    return;
+  }
 
   let urls = [];
   if (inputMode === 'single') {
@@ -486,6 +579,7 @@ async function startDownload() {
     custom_filename: urls.length === 1 ? customFilename : (customFilename ? `${customFilename}_${idx + 1}` : ''),
     embed_thumbnail: embedThumb,
     embed_subs: embedSubs,
+    target_size_mb: targetSizeMb,
     title_hint: u.title_hint,
     thumbnail_hint: u.thumbnail_hint,
   }));
@@ -566,7 +660,8 @@ function buildStatsHtml(t) {
   if (t.status === 'downloading') {
     return `<span>${escapeHtml(t.message || 'ダウンロード中')} (${escapeHtml(t.downloaded_str)} / ${escapeHtml(t.total_str)})</span><span>速度: ${escapeHtml(t.speed_str)} | 残り: ${escapeHtml(t.eta_str)}</span>`;
   } else if (t.status === 'completed') {
-    return `<span style="color:#34d399;">✓ 保存完了 (${escapeHtml(t.file_size_str)})</span><span>${escapeHtml(t.completed_at || '')}</span>`;
+    const doneLabel = t.message || '保存完了';
+    return `<span style="color:#34d399;">✓ ${escapeHtml(doneLabel)} (${escapeHtml(t.file_size_str)})</span><span>${escapeHtml(t.completed_at || '')}</span>`;
   }
   return `<span class="status-msg">${escapeHtml(t.message || '')}</span><span>${progress.toFixed(0)}%</span>`;
 }

@@ -2,12 +2,14 @@ import os
 import re
 import io
 import sys
+import glob
 import json
 import time
 import uuid
 import queue
 import socket
 import shutil
+import tempfile
 import threading
 import subprocess
 from pathlib import Path
@@ -247,8 +249,18 @@ class DownloadItemRequest(BaseModel):
     custom_filename: Optional[str] = ""
     embed_thumbnail: bool = False
     embed_subs: bool = False
+    target_size_mb: Optional[float] = None
     title_hint: Optional[str] = ""
     thumbnail_hint: Optional[str] = ""
+
+
+class LocalCompressRequest(BaseModel):
+    input_path: str
+    save_dir: str = DEFAULT_SAVE_DIR
+    target_size_mb: float = 20.0
+    start_time: Optional[str] = ""
+    end_time: Optional[str] = ""
+    custom_filename: Optional[str] = ""
 
 
 class BatchDownloadRequest(BaseModel):
@@ -323,6 +335,58 @@ def pick_folder(req: FolderPickRequest):
         return {"selected": False, "path": initial}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"フォルダ選択ダイアログを開けませんでした: {e}")
+
+
+@app.post("/api/pick-file")
+def pick_video_file(req: FolderPickRequest):
+    with tasks_lock:
+        fallback_dir = settings_data.get("save_dir") or DEFAULT_SAVE_DIR
+    initial = req.current_dir if req.current_dir and os.path.isdir(req.current_dir) else fallback_dir
+    if not os.path.isdir(initial):
+        initial = DEFAULT_SAVE_DIR
+
+    global webview_window
+    if webview_window is not None:
+        try:
+            import webview
+            dialog_type = getattr(webview, "FileDialog", None)
+            open_mode = dialog_type.OPEN if dialog_type else webview.OPEN_DIALOG
+            result = webview_window.create_file_dialog(
+                open_mode,
+                directory=initial,
+                allow_multiple=False,
+                file_types=("メディアファイル (*.mp4;*.mkv;*.webm;*.mov;*.avi;*.mp3;*.m4a;*.wav;*.flac)", "すべてのファイル (*.*)")
+            )
+            if result and len(result) > 0:
+                chosen = os.path.normpath(result[0])
+                size_str = format_bytes(os.path.getsize(chosen)) if os.path.isfile(chosen) else "-"
+                return {"selected": True, "path": chosen, "filename": os.path.basename(chosen), "size_str": size_str}
+            return {"selected": False, "path": ""}
+        except Exception:
+            pass
+
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        chosen = filedialog.askopenfilename(
+            initialdir=initial,
+            title="圧縮する動画・音声ファイルを選択",
+            filetypes=[
+                ("メディアファイル", "*.mp4 *.mkv *.webm *.mov *.avi *.mp3 *.m4a *.wav *.flac"),
+                ("すべてのファイル", "*.*"),
+            ]
+        )
+        root.destroy()
+        if chosen:
+            chosen = os.path.normpath(chosen)
+            size_str = format_bytes(os.path.getsize(chosen)) if os.path.isfile(chosen) else "-"
+            return {"selected": True, "path": chosen, "filename": os.path.basename(chosen), "size_str": size_str}
+        return {"selected": False, "path": ""}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ファイル選択ダイアログを開けませんでした: {e}")
 
 
 def reveal_in_explorer(target: str):
@@ -412,12 +476,45 @@ def fetch_info(req: InfoRequest):
     }
 
 
+def probe_media_info(input_path: str) -> tuple[Optional[float], bool]:
+    """Read duration (seconds) and whether a real video stream exists using bundled ffmpeg.exe."""
+    if not FFMPEG_EXE or not os.path.isfile(input_path):
+        return None, False
+    try:
+        res = subprocess.run(
+            [FFMPEG_EXE, "-hide_banner", "-i", input_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+        info_text = res.stderr or ""
+        dur = None
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", info_text)
+        if m:
+            dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+
+        # Ignore embedded cover art (attached pic) when checking for real video streams
+        has_video = False
+        for line in info_text.splitlines():
+            if "Video:" in line and "(attached pic)" not in line.lower():
+                has_video = True
+                break
+        return dur, has_video
+    except Exception:
+        return None, False
+
+
 def trim_media_with_ffmpeg(
     task_id: str,
     input_path: str,
     start_sec: Optional[float],
     end_sec: Optional[float],
     total_duration: Optional[float],
+    progress_start: float = 85.0,
+    progress_end: float = 99.5,
 ) -> str:
     """Fast local trim using FFmpeg stream copy with real-time progress and cancel support."""
     if not FFMPEG_EXE or not os.path.isfile(input_path):
@@ -432,6 +529,7 @@ def trim_media_with_ffmpeg(
 
     base, ext = os.path.splitext(input_path)
     tmp_output = f"{base}.__trim_tmp__{ext}"
+    progress_span = max(1.0, progress_end - progress_start)
 
     def run_ffmpeg_cmd(copy_codec: bool) -> int:
         cmd = [FFMPEG_EXE, "-y", "-hide_banner", "-loglevel", "error"]
@@ -467,7 +565,7 @@ def trim_media_with_ffmpeg(
                         if val_str.isdigit() and clip_duration and clip_duration > 0:
                             out_sec = int(val_str) / 1_000_000.0
                             ratio = min(1.0, max(0.0, out_sec / clip_duration))
-                            pct = round(85.0 + ratio * 14.5, 1)
+                            pct = round(progress_start + ratio * progress_span, 1)
                             with tasks_lock:
                                 if task_id in tasks:
                                     tasks[task_id].update({
@@ -488,7 +586,7 @@ def trim_media_with_ffmpeg(
             if task_id in tasks:
                 tasks[task_id].update({
                     "status": "processing",
-                    "progress": max(tasks[task_id]["progress"], 85.0),
+                    "progress": max(tasks[task_id]["progress"], progress_start),
                     "speed_str": "-",
                     "eta_str": "処理中",
                     "message": "指定範囲を高速切り抜き中...",
@@ -499,7 +597,6 @@ def trim_media_with_ffmpeg(
             raise DownloadCancelled("ユーザーによりキャンセルされました")
 
         if rc != 0 or not os.path.isfile(tmp_output) or os.path.getsize(tmp_output) == 0:
-            # Fallback to re-encode if stream copy fails for an unusual codec/container pair
             with tasks_lock:
                 if task_id in tasks:
                     tasks[task_id]["message"] = "互換モードで切り抜き中..."
@@ -515,6 +612,233 @@ def trim_media_with_ffmpeg(
         if os.path.exists(tmp_output):
             try:
                 os.remove(tmp_output)
+            except OSError:
+                pass
+
+
+def compress_media_to_target_size(
+    task_id: str,
+    input_path: str,
+    output_path: str,
+    target_mb: float,
+    progress_start: float = 55.0,
+    progress_end: float = 99.5,
+    start_sec: Optional[float] = None,
+    end_sec: Optional[float] = None,
+    replace_input: bool = True,
+) -> tuple[str, bool]:
+    """Compress video/audio to <= target_mb MB using 2-pass libx264/AAC with real-time progress.
+    Returns (final_path, was_compressed).
+    """
+    if not FFMPEG_EXE or not os.path.isfile(input_path):
+        return input_path, False
+
+    target_mb = max(1.0, float(target_mb))
+    max_allowed_bytes = int(target_mb * 1024 * 1024)
+    has_clip = (start_sec is not None) or (end_sec is not None)
+
+    # Skip compression if already under target size and no clipping is requested
+    current_size = os.path.getsize(input_path)
+    if not has_clip and current_size <= max_allowed_bytes:
+        return input_path, False
+
+    probed_dur, has_video = probe_media_info(input_path)
+    s_val = start_sec if start_sec is not None else 0.0
+    if end_sec is not None:
+        effective_duration = max(1.0, end_sec - s_val)
+    elif probed_dur and probed_dur > s_val:
+        effective_duration = max(1.0, probed_dur - s_val)
+    else:
+        effective_duration = 60.0
+
+    # Reserve 4% headroom for MP4 container muxing overhead so final size stays reliably <= target_mb
+    budget_bytes = int(max_allowed_bytes * 0.96)
+    total_kbps = max(64, int((budget_bytes * 8) / effective_duration / 1000))
+
+    span = max(1.0, progress_end - progress_start)
+    passlog_prefix = os.path.join(tempfile.gettempdir(), f"mds_2pass_{task_id}")
+    out_dir = os.path.dirname(output_path)
+    os.makedirs(out_dir, exist_ok=True)
+    base_out, ext_out = os.path.splitext(output_path)
+    tmp_output = f"{base_out}.__compress_tmp__{ext_out}"
+    null_sink = "NUL" if os.name == "nt" else "/dev/null"
+
+    def run_pass(cmd: List[str], phase_start: float, phase_end: float, label: str) -> int:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        with tasks_lock:
+            active_subprocesses[task_id] = proc
+        try:
+            if proc.stdout:
+                for line in proc.stdout:
+                    if is_cancelled(task_id):
+                        proc.terminate()
+                        raise DownloadCancelled("ユーザーによりキャンセルされました")
+                    line = line.strip()
+                    if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+                        val_str = line.split("=", 1)[1].strip()
+                        if val_str.isdigit() and effective_duration > 0:
+                            out_sec = int(val_str) / 1_000_000.0
+                            ratio = min(1.0, max(0.0, out_sec / effective_duration))
+                            pct = round(phase_start + ratio * (phase_end - phase_start), 1)
+                            with tasks_lock:
+                                if task_id in tasks:
+                                    tasks[task_id].update({
+                                        "status": "processing",
+                                        "progress": max(tasks[task_id]["progress"], pct),
+                                        "speed_str": "-",
+                                        "eta_str": "圧縮中",
+                                        "message": f"{label}... ({int(ratio * 100)}%)",
+                                    })
+            proc.wait()
+            return proc.returncode
+        finally:
+            with tasks_lock:
+                active_subprocesses.pop(task_id, None)
+
+    try:
+        with tasks_lock:
+            if task_id in tasks:
+                tasks[task_id].update({
+                    "status": "processing",
+                    "progress": max(tasks[task_id]["progress"], progress_start),
+                    "speed_str": "-",
+                    "eta_str": "圧縮準備中",
+                    "message": f"{target_mb:g}MB 以下へ圧縮中...",
+                })
+
+        seek_args: List[str] = []
+        if s_val > 0:
+            seek_args += ["-ss", f"{s_val:.3f}"]
+        dur_args: List[str] = []
+        if end_sec is not None:
+            dur_args += ["-t", f"{effective_duration:.3f}"]
+
+        if has_video:
+            # Allocate audio bitrate sensibly relative to total bitrate budget
+            if total_kbps >= 1500:
+                audio_kbps = 128
+            elif total_kbps >= 700:
+                audio_kbps = 96
+            elif total_kbps >= 350:
+                audio_kbps = 64
+            else:
+                audio_kbps = 48
+            video_kbps = max(80, total_kbps - audio_kbps)
+
+            # Auto-downscale very low bitrate encodes so video stays sharp instead of blocky
+            if video_kbps < 450:
+                vf_scale = "scale=-2:'min(480,ih)'"
+            elif video_kbps < 1300:
+                vf_scale = "scale=-2:'min(720,ih)'"
+            elif video_kbps < 3200:
+                vf_scale = "scale=-2:'min(1080,ih)'"
+            else:
+                vf_scale = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+
+            p1_end = progress_start + span * 0.35
+            cmd_pass1 = (
+                [FFMPEG_EXE, "-y", "-hide_banner", "-loglevel", "error"]
+                + seek_args
+                + ["-i", input_path]
+                + dur_args
+                + [
+                    "-vf", vf_scale,
+                    "-c:v", "libx264",
+                    "-b:v", f"{video_kbps}k",
+                    "-preset", "fast",
+                    "-pix_fmt", "yuv420p",
+                    "-pass", "1",
+                    "-passlogfile", passlog_prefix,
+                    "-an",
+                    "-f", "mp4",
+                    "-progress", "pipe:1",
+                    "-nostats",
+                    null_sink,
+                ]
+            )
+            rc1 = run_pass(cmd_pass1, progress_start, p1_end, f"圧縮解析中 (1/2・目標 {target_mb:g}MB)")
+            if is_cancelled(task_id):
+                raise DownloadCancelled("ユーザーによりキャンセルされました")
+            if rc1 != 0:
+                raise RuntimeError("圧縮の解析パス(1/2)に失敗しました")
+
+            cmd_pass2 = (
+                [FFMPEG_EXE, "-y", "-hide_banner", "-loglevel", "error"]
+                + seek_args
+                + ["-i", input_path]
+                + dur_args
+                + [
+                    "-vf", vf_scale,
+                    "-c:v", "libx264",
+                    "-b:v", f"{video_kbps}k",
+                    "-maxrate", f"{int(video_kbps * 1.4)}k",
+                    "-bufsize", f"{int(video_kbps * 2)}k",
+                    "-preset", "fast",
+                    "-pix_fmt", "yuv420p",
+                    "-pass", "2",
+                    "-passlogfile", passlog_prefix,
+                    "-c:a", "aac",
+                    "-b:a", f"{audio_kbps}k",
+                    "-movflags", "+faststart",
+                    "-progress", "pipe:1",
+                    "-nostats",
+                    tmp_output,
+                ]
+            )
+            rc2 = run_pass(cmd_pass2, p1_end, progress_end, f"圧縮エンコード中 (2/2・目標 {target_mb:g}MB)")
+            if is_cancelled(task_id):
+                raise DownloadCancelled("ユーザーによりキャンセルされました")
+            if rc2 != 0 or not os.path.isfile(tmp_output) or os.path.getsize(tmp_output) == 0:
+                raise RuntimeError("圧縮エンコード(2/2)に失敗しました")
+        else:
+            # Audio-only target-size compression
+            audio_kbps = max(32, min(320, total_kbps))
+            ext_lower = ext_out.lower()
+            if ext_lower == ".mp3":
+                acodec_args = ["-c:a", "libmp3lame", "-b:a", f"{audio_kbps}k"]
+            elif ext_lower == ".opus":
+                acodec_args = ["-c:a", "libopus", "-b:a", f"{audio_kbps}k"]
+            else:
+                acodec_args = ["-c:a", "aac", "-b:a", f"{audio_kbps}k"]
+
+            cmd_audio = (
+                [FFMPEG_EXE, "-y", "-hide_banner", "-loglevel", "error"]
+                + seek_args
+                + ["-i", input_path]
+                + dur_args
+                + ["-vn"]
+                + acodec_args
+                + ["-progress", "pipe:1", "-nostats", tmp_output]
+            )
+            rc = run_pass(cmd_audio, progress_start, progress_end, f"音声圧縮中 (目標 {target_mb:g}MB)")
+            if is_cancelled(task_id):
+                raise DownloadCancelled("ユーザーによりキャンセルされました")
+            if rc != 0 or not os.path.isfile(tmp_output):
+                raise RuntimeError("音声圧縮に失敗しました")
+
+        os.replace(tmp_output, output_path)
+        if replace_input and os.path.normcase(os.path.abspath(input_path)) != os.path.normcase(os.path.abspath(output_path)):
+            try:
+                os.remove(input_path)
+            except OSError:
+                pass
+        return output_path, True
+    finally:
+        if os.path.exists(tmp_output):
+            try:
+                os.remove(tmp_output)
+            except OSError:
+                pass
+        for f in glob.glob(f"{passlog_prefix}*"):
+            try:
+                os.remove(f)
             except OSError:
                 pass
 
@@ -584,7 +908,15 @@ def run_download_worker(task_id: str, req: DownloadItemRequest):
         return
 
     needs_clip = (start_sec is not None) or (end_sec is not None)
-    dl_ceiling = 84.0 if needs_clip else 94.0
+    needs_compress = bool(req.target_size_mb and req.target_size_mb > 0)
+    if needs_clip and needs_compress:
+        dl_ceiling = 45.0
+    elif needs_compress:
+        dl_ceiling = 50.0
+    elif needs_clip:
+        dl_ceiling = 84.0
+    else:
+        dl_ceiling = 94.0
 
     with tasks_lock:
         if task_id in tasks:
@@ -790,13 +1122,40 @@ def run_download_worker(task_id: str, req: DownloadItemRequest):
 
             # Perform fast local FFmpeg clipping if start_time / end_time was specified
             if needs_clip and os.path.isfile(final_path):
+                clip_end_pct = 58.0 if needs_compress else 99.5
                 final_path = trim_media_with_ffmpeg(
                     task_id=task_id,
                     input_path=final_path,
                     start_sec=start_sec,
                     end_sec=end_sec,
                     total_duration=total_duration,
+                    progress_start=dl_ceiling,
+                    progress_end=clip_end_pct,
                 )
+
+            # Perform target-size compression if target_size_mb was requested
+            completion_msg = "保存完了"
+            if needs_compress and req.target_size_mb and os.path.isfile(final_path):
+                comp_start_pct = 58.0 if needs_clip else 50.0
+                base_p, orig_ext = os.path.splitext(final_path)
+                if req.media_type == "video":
+                    target_out = f"{base_p}.mp4" if orig_ext.lower() != ".mkv" else final_path
+                else:
+                    target_out = f"{base_p}.mp3" if orig_ext.lower() in (".wav", ".flac") else final_path
+
+                final_path, was_compressed = compress_media_to_target_size(
+                    task_id=task_id,
+                    input_path=final_path,
+                    output_path=target_out,
+                    target_mb=req.target_size_mb,
+                    progress_start=comp_start_pct,
+                    progress_end=99.5,
+                    replace_input=True,
+                )
+                if was_compressed:
+                    completion_msg = f"保存・圧縮完了 (目標 {req.target_size_mb:g}MB以下)"
+                else:
+                    completion_msg = f"保存完了 (すでに {req.target_size_mb:g}MB以下のため無圧縮)"
 
             file_size_str = "-"
             if os.path.isfile(final_path):
@@ -816,13 +1175,148 @@ def run_download_worker(task_id: str, req: DownloadItemRequest):
                         "eta_str": "完了",
                         "file_path": final_path,
                         "file_size_str": file_size_str,
-                        "message": "保存完了",
+                        "message": completion_msg,
                         "completed_at": completed_at,
                     })
                     hist_entry = dict(tasks[task_id])
                     history_data.insert(0, hist_entry)
                     save_history_locked()
 
+    except DownloadCancelled:
+        with tasks_lock:
+            if task_id in tasks:
+                tasks[task_id].update({
+                    "status": "cancelled",
+                    "message": "キャンセルされました",
+                    "speed_str": "-",
+                    "eta_str": "-",
+                })
+    except Exception as e:
+        err_msg = strip_ansi(str(e))
+        cancelled = is_cancelled(task_id)
+        with tasks_lock:
+            if task_id in tasks:
+                tasks[task_id].update({
+                    "status": "cancelled" if cancelled else "error",
+                    "message": "キャンセルされました" if cancelled else f"エラー: {err_msg}",
+                    "speed_str": "-",
+                    "eta_str": "-",
+                })
+
+
+def run_local_compress_worker(task_id: str, req: LocalCompressRequest):
+    with tasks_lock:
+        if task_id not in tasks:
+            return
+        if is_cancelled(task_id):
+            tasks[task_id].update({
+                "status": "cancelled",
+                "message": "キャンセルされました",
+                "speed_str": "-",
+                "eta_str": "-",
+            })
+            return
+
+    input_path = os.path.normpath(req.input_path.strip())
+    if not os.path.isfile(input_path):
+        with tasks_lock:
+            if task_id in tasks:
+                tasks[task_id].update({
+                    "status": "error",
+                    "message": "エラー: 指定されたファイルが見つかりません",
+                    "speed_str": "-",
+                    "eta_str": "-",
+                })
+        return
+
+    save_dir = os.path.normpath(req.save_dir.strip() or os.path.dirname(input_path) or DEFAULT_SAVE_DIR)
+    try:
+        os.makedirs(save_dir, exist_ok=True)
+    except Exception as e:
+        with tasks_lock:
+            if task_id in tasks:
+                tasks[task_id].update({
+                    "status": "error",
+                    "message": f"エラー: 保存先フォルダを作成できません ({e})",
+                    "speed_str": "-",
+                    "eta_str": "-",
+                })
+        return
+
+    start_sec = parse_time_to_seconds(req.start_time)
+    end_sec = parse_time_to_seconds(req.end_time)
+    if (req.start_time and req.start_time.strip() and start_sec is None) or (
+        req.end_time and req.end_time.strip() and end_sec is None
+    ):
+        with tasks_lock:
+            if task_id in tasks:
+                tasks[task_id].update({
+                    "status": "error",
+                    "message": "エラー: 開始・終了時間の形式が正しくありません（例: 01:20）",
+                    "speed_str": "-",
+                    "eta_str": "-",
+                })
+        return
+
+    if start_sec is not None and end_sec is not None and end_sec <= start_sec:
+        with tasks_lock:
+            if task_id in tasks:
+                tasks[task_id].update({
+                    "status": "error",
+                    "message": "エラー: 終了時間は開始時間より後に設定してください",
+                    "speed_str": "-",
+                    "eta_str": "-",
+                })
+        return
+
+    target_mb = max(1.0, float(req.target_size_mb))
+    orig_stem, orig_ext = os.path.splitext(os.path.basename(input_path))
+    _, has_video = probe_media_info(input_path)
+    out_ext = ".mp4" if has_video else (orig_ext if orig_ext.lower() in (".mp3", ".m4a", ".opus") else ".mp3")
+
+    if req.custom_filename and req.custom_filename.strip():
+        out_stem = sanitize_custom_filename(req.custom_filename)
+    else:
+        out_stem = f"{orig_stem}_{target_mb:g}MB"
+
+    output_path = os.path.join(save_dir, f"{out_stem}{out_ext}")
+    if os.path.normcase(os.path.abspath(output_path)) == os.path.normcase(os.path.abspath(input_path)):
+        output_path = os.path.join(save_dir, f"{out_stem}_compressed{out_ext}")
+
+    try:
+        final_path, was_compressed = compress_media_to_target_size(
+            task_id=task_id,
+            input_path=input_path,
+            output_path=output_path,
+            target_mb=target_mb,
+            progress_start=2.0,
+            progress_end=99.5,
+            start_sec=start_sec,
+            end_sec=end_sec,
+            replace_input=False,
+        )
+        file_size_str = format_bytes(os.path.getsize(final_path)) if os.path.isfile(final_path) else "-"
+        completed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg = (
+            f"圧縮完了 (目標 {target_mb:g}MB以下)"
+            if was_compressed
+            else f"元ファイルがすでに {target_mb:g}MB以下 ({file_size_str}) のため無圧縮"
+        )
+        with tasks_lock:
+            if task_id in tasks:
+                tasks[task_id].update({
+                    "status": "completed",
+                    "progress": 100.0,
+                    "speed_str": "-",
+                    "eta_str": "完了",
+                    "file_path": final_path,
+                    "file_size_str": file_size_str,
+                    "message": msg,
+                    "completed_at": completed_at,
+                })
+                hist_entry = dict(tasks[task_id])
+                history_data.insert(0, hist_entry)
+                save_history_locked()
     except DownloadCancelled:
         with tasks_lock:
             if task_id in tasks:
@@ -852,7 +1346,10 @@ def queue_worker_loop():
         except queue.Empty:
             continue
         try:
-            run_download_worker(task_id, item)
+            if isinstance(item, LocalCompressRequest):
+                run_local_compress_worker(task_id, item)
+            else:
+                run_download_worker(task_id, item)
         except Exception as e:
             with tasks_lock:
                 if task_id in tasks:
@@ -900,6 +1397,9 @@ def start_downloads(batch: BatchDownloadRequest):
         clip_label = ""
         if item.start_time or item.end_time:
             clip_label = f" [{item.start_time or '0:00'} ~ {item.end_time or '最後'}]"
+        compress_label = ""
+        if item.target_size_mb and item.target_size_mb > 0:
+            compress_label = f" / ≦{item.target_size_mb:g}MB圧縮"
 
         task_obj = {
             "id": task_id,
@@ -909,7 +1409,7 @@ def start_downloads(batch: BatchDownloadRequest):
             "extractor": "待機中",
             "media_type": item.media_type,
             "container": item.container.upper(),
-            "quality_label": f"{item.container.upper()} / {quality_label}{clip_label}",
+            "quality_label": f"{item.container.upper()} / {quality_label}{clip_label}{compress_label}",
             "save_dir": save_dir,
             "file_path": save_dir,
             "file_size_str": "-",
@@ -936,6 +1436,52 @@ def start_downloads(batch: BatchDownloadRequest):
                 save_settings(settings_data)
 
     return {"started": created_ids}
+
+
+@app.post("/api/compress-local")
+def start_local_compress(req: LocalCompressRequest):
+    input_path = req.input_path.strip()
+    if not input_path or not os.path.isfile(input_path):
+        raise HTTPException(status_code=400, detail="圧縮するファイルを選択してください")
+    if req.target_size_mb is None or req.target_size_mb < 1:
+        raise HTTPException(status_code=400, detail="目標サイズは 1MB 以上を指定してください")
+
+    task_id = str(uuid.uuid4())
+    save_dir = os.path.normpath(req.save_dir.strip() or os.path.dirname(input_path) or DEFAULT_SAVE_DIR)
+    clip_label = ""
+    if req.start_time or req.end_time:
+        clip_label = f" [{req.start_time or '0:00'} ~ {req.end_time or '最後'}]"
+
+    task_obj = {
+        "id": task_id,
+        "url": input_path,
+        "title": os.path.basename(input_path),
+        "thumbnail": "",
+        "extractor": "ローカル圧縮",
+        "media_type": "video",
+        "container": "MP4",
+        "quality_label": f"圧縮 / ≦{req.target_size_mb:g}MB{clip_label}",
+        "save_dir": save_dir,
+        "file_path": save_dir,
+        "file_size_str": "-",
+        "status": "queued",
+        "progress": 0.0,
+        "downloaded_str": "0 B",
+        "total_str": "-",
+        "speed_str": "待機中",
+        "eta_str": "--:--",
+        "message": "圧縮キューで順番待ち中...",
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with tasks_lock:
+        tasks[task_id] = task_obj
+        cancel_flags[task_id] = False
+        if settings_data.get("save_dir") != save_dir:
+            settings_data["save_dir"] = save_dir
+            save_settings(settings_data)
+
+    download_queue.put((task_id, req))
+    return {"started": [task_id]}
 
 
 @app.get("/api/tasks")

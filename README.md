@@ -80,10 +80,19 @@ python build_exe.py
 
 ---
 
-## 免責事項
+## 免責事項・ご利用上の注意
 
-本ツールは私的利用・著作権法および各サービスの利用規約の範囲内でご使用ください。本ツールの使用により生じたいかなるトラブル・損害についても、作者は一切の責任を負いません。
+本ツールは、著作権者から許諾を得たコンテンツ・ご自身が投稿した動画のバックアップ・クリエイティブコモンズ素材など、**著作権法および各サービスの利用規約の範囲内**でご使用ください。DRM（技術的保護手段）の回避機能は備えていません。本ツールの使用により生じたいかなるトラブル・損害についても、作者は一切の責任を負いません。
+
+## サードパーティライセンス
+
+本ソフトウェアおよび配布バイナリ（Releases）は以下のオープンソースソフトウェアを利用・同梱しています：
+
+- **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** — The Unlicense
+- **[FFmpeg](https://ffmpeg.org/)** (via [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg)) — LGPL / GPL（ソースコードは [ffmpeg.org](https://ffmpeg.org/download.html) より入手可能です）
+- **[FastAPI](https://github.com/fastapi/fastapi)** / **[Uvicorn](https://github.com/encode/uvicorn)** — MIT / BSD License
+- **[pywebview](https://github.com/r0x0r/pywebview)** — BSD-3-Clause License
 
 ## License
 
-[MIT License](LICENSE)
+本プロジェクト独自のソースコードは [MIT License](LICENSE) のもとで公開されています。

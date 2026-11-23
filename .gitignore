@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# Build & executables (distributed via GitHub Releases)
+build/
+dist/
+*.exe
+*.spec
+
+# Local runtime state
+history.json
+settings.json
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
